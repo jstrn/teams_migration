@@ -231,6 +231,10 @@ Respond with ONLY the department name (one of: {departments}) or "Unknown" if no
                 child_name = child_row['Name']
                 child_type = child_row['Type']
                 
+                # Only classify folders, skip files
+                if child_type != 'Folder':
+                    continue
+                
                 print(f"    Classifying {child_type}: {child_name}")
                 
                 # Get samples from this child and its descendants
