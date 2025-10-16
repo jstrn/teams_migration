@@ -149,7 +149,7 @@ Respond with ONLY the department name (one of: {departments}) or "Unknown" if no
             # Validate the response
             if classification in DEPARTMENTS:
                 return classification
-        else:
+            else:
                 print(f"OpenAI returned invalid classification: {classification}")
                 return "Unknown"
                 
