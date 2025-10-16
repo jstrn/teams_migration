@@ -1,0 +1,26 @@
+{
+  "paths": [],
+  "outputDirectory": ".\\output",
+  "rawDataFile": ".\\output\\raw_scan_data.csv",
+  "permissionsFile": ".\\output\\permissions_data.csv",
+  "checkpointFile": ".\\output\\checkpoint.json",
+  "excelOutputFile": ".\\output\\migration_analysis.xlsx",
+  "scanFiles": false,
+  "thresholds": {
+    "maxPathLength": 255,
+    "maxFileSize": 52428800,
+    "maxFilesPerFolder": 20000
+  },
+  "unsafeExtensions": [
+    ".mdb", ".accdb", ".sqlite", ".sqlite3", ".db", ".dbf", ".ndf", ".mdf", 
+    ".ldf", ".ibd", ".fdb", ".gdb", ".edb", ".pst", ".ost", ".cdb", ".realm", 
+    ".mv.db", ".ldb", ".wt", ".sst", ".frm", ".myd", ".myi", ".nsf", ".bak", 
+    ".dmp", ".qbw", ".qbb", ".qbx", ".qba", ".qbm", ".qbmb", ".myob", ".sage", 
+    ".peachtree", ".acc", ".tlg"
+  ],
+  "unsupportedCharacters": [
+    "~", "#", "%", "&", "*", "{", "}", "\\", ":", "<", ">", "?", "/", "|", "\""
+  ]
+}
+
+

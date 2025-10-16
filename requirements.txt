@@ -1,0 +1,15 @@
+# This file is no longer needed!
+# Dependencies are managed automatically by uv via inline script metadata in classify_and_report.py and backup_sharepoint_to_azure.py
+#
+# If you still want to use pip/venv for some reason:
+pandas>=1.5.0
+openpyxl>=3.0.0
+msal>=1.24.0
+requests>=2.31.0
+azure-storage-blob>=12.19.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
+#
+# But we recommend using uv for zero-configuration setup!
+
+
