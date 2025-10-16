@@ -45,7 +45,10 @@ param(
     [string]$CheckpointFile,
     
     [Parameter(Mandatory=$false)]
-    [switch]$Resume
+    [switch]$Resume,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$PermissionsOnly
 )
 
 # Initialize counters
@@ -104,24 +107,122 @@ function ConvertTo-AccessLevel {
     }
 }
 
-# Function to get non-inherited permissions for a folder
+# Function to compare ACLs and determine if child has different/more permissive permissions than parent
+function Compare-ACLs {
+    param(
+        [System.Security.AccessControl.DirectorySecurity]$ChildACL,
+        [System.Security.AccessControl.DirectorySecurity]$ParentACL,
+        [bool]$IsFile
+    )
+    
+    if ($null -eq $ChildACL -or $null -eq $ParentACL) {
+        return $false
+    }
+    
+    # For directories: check if permissions differ from parent
+    if (-not $IsFile) {
+        return (Compare-ACL-Entries -ChildACL $ChildACL -ParentACL $ParentACL -CheckDifference $true)
+    }
+    # For files: check if permissions are less restrictive (more permissive) than parent
+    else {
+        return (Compare-ACL-Entries -ChildACL $ChildACL -ParentACL $ParentACL -CheckDifference $false)
+    }
+}
+
+# Function to compare ACL entries between child and parent
+function Compare-ACL-Entries {
+    param(
+        [System.Security.AccessControl.DirectorySecurity]$ChildACL,
+        [System.Security.AccessControl.DirectorySecurity]$ParentACL,
+        [bool]$CheckDifference
+    )
+    
+    # Get non-inherited entries from child
+    $childEntries = @()
+    foreach ($access in $ChildACL.Access) {
+        if (-not $access.IsInherited) {
+            $childEntries += $access
+        }
+    }
+    
+    # Get non-inherited entries from parent
+    $parentEntries = @()
+    foreach ($access in $ParentACL.Access) {
+        if (-not $access.IsInherited) {
+            $parentEntries += $access
+        }
+    }
+    
+    # If checking for differences (directories), return true if any non-inherited entries exist
+    if ($CheckDifference) {
+        return $childEntries.Count -gt 0
+    }
+    
+    # If checking for more permissive (files), compare permissions
+    foreach ($childEntry in $childEntries) {
+        $accountName = $childEntry.IdentityReference.Value
+        
+        # Find corresponding entry in parent
+        $parentEntry = $parentEntries | Where-Object { $_.IdentityReference.Value -eq $accountName }
+        
+        if ($null -eq $parentEntry) {
+            # Child has explicit permission that parent doesn't have
+            if ($childEntry.AccessControlType -eq 'Allow') {
+                return $true
+            }
+        } else {
+            # Compare permission levels
+            if ($childEntry.AccessControlType -eq 'Allow' -and $parentEntry.AccessControlType -eq 'Allow') {
+                # Check if child has more permissive rights
+                if (Is-MorePermissive -ChildRights $childEntry.FileSystemRights -ParentRights $parentEntry.FileSystemRights) {
+                    return $true
+                }
+            }
+        }
+    }
+    
+    return $false
+}
+
+# Function to determine if child rights are more permissive than parent rights
+function Is-MorePermissive {
+    param(
+        [System.Security.AccessControl.FileSystemRights]$ChildRights,
+        [System.Security.AccessControl.FileSystemRights]$ParentRights
+    )
+    
+    # Convert to numeric values for comparison
+    $childValue = [int]$ChildRights
+    $parentValue = [int]$ParentRights
+    
+    # Check if child has additional rights not present in parent
+    $additionalRights = $childValue -band (-bnot $parentValue)
+    return $additionalRights -ne 0
+}
+
+# Function to get non-inherited permissions for a folder (AccessEnum logic)
 function Get-FolderPermissions {
     param([string]$FolderPath)
     
     try {
         $acl = Get-Acl -Path $FolderPath -ErrorAction Stop
         
-        # Check if all permissions are inherited
-        $hasExplicitPermissions = $false
-        foreach ($access in $acl.Access) {
-            if (-not $access.IsInherited) {
-                $hasExplicitPermissions = $true
-                break
+        # Get parent folder ACL for comparison
+        $parentPath = Split-Path -Path $FolderPath -Parent
+        $parentACL = $null
+        if ($parentPath -and (Test-Path $parentPath)) {
+            try {
+                $parentACL = Get-Acl -Path $parentPath -ErrorAction Stop
+            } catch {
+                # Parent might not be accessible, continue without comparison
             }
         }
         
-        if (-not $hasExplicitPermissions) {
-            return @()
+        # Apply AccessEnum logic: only include if permissions differ from parent
+        if ($null -ne $parentACL) {
+            if (-not (Compare-ACLs -ChildACL $acl -ParentACL $parentACL -IsFile $false)) {
+                return @()
+            }
         }
         
         # Extract non-inherited permissions
@@ -150,15 +251,75 @@ function Get-FolderPermissions {
     }
 }
 
+# Function to get non-inherited permissions for a file (AccessEnum logic)
+function Get-FilePermissions {
+    param([string]$FilePath)
+    
+    try {
+        $acl = Get-Acl -Path $FilePath -ErrorAction Stop
+        
+        # Get parent folder ACL for comparison
+        $parentPath = Split-Path -Path $FilePath -Parent
+        $parentACL = $null
+        if ($parentPath -and (Test-Path $parentPath)) {
+            try {
+                $parentACL = Get-Acl -Path $parentPath -ErrorAction Stop
+            } catch {
+                # Parent might not be accessible, continue without comparison
+            }
+        }
+        
+        # Apply AccessEnum logic: only include if permissions are less restrictive than parent
+        if ($null -ne $parentACL) {
+            if (-not (Compare-ACLs -ChildACL $acl -ParentACL $parentACL -IsFile $true)) {
+                return $false  # File doesn't meet AccessEnum criteria
+            }
+        }
+        
+        # Check if file has any non-inherited permissions
+        $hasExplicitPermissions = $false
+        foreach ($access in $acl.Access) {
+            if (-not $access.IsInherited) {
+                $hasExplicitPermissions = $true
+                break
+            }
+        }
+        
+        return $hasExplicitPermissions
+    } catch {
+        Write-Warning "Failed to get permissions for $FilePath : $_"
+        return $false
+    }
+}
+
 # Function to check for unsupported characters
 function Test-UnsupportedCharacters {
     param([string]$Name, [array]$UnsupportedChars)
     
+    if ([string]::IsNullOrEmpty($Name)) {
+        return $false
+    }
+    
+    # Check for trailing spaces or periods (Windows restriction)
+    if ($Name.EndsWith(" ") -or $Name.EndsWith(".")) {
+        return $true
+    }
+    
+    # Check for unsupported characters
     foreach ($char in $UnsupportedChars) {
         if ($Name.Contains($char)) {
             return $true
         }
     }
+    
+    # Check for control characters (ASCII 0-31 except tab, newline, carriage return)
+    for ($i = 0; $i -lt $Name.Length; $i++) {
+        $charCode = [int][char]$Name[$i]
+        if ($charCode -ge 0 -and $charCode -le 31 -and $charCode -notin @(9, 10, 13)) {
+            return $true
+        }
+    }
+    
     return $false
 }
 
@@ -241,7 +402,11 @@ function Get-ETA {
 
 # Main scanning function
 function Invoke-FileSystemScan {
-    Write-Host "Starting file system scan for: $Path" -ForegroundColor Cyan
+    if ($PermissionsOnly) {
+        Write-Host "Starting permissions collection for: $Path" -ForegroundColor Cyan
+    } else {
+        Write-Host "Starting file system scan for: $Path" -ForegroundColor Cyan
+    }
     
     # Check if path exists
     if (-not (Test-Path -Path $Path)) {
@@ -250,7 +415,7 @@ function Invoke-FileSystemScan {
     }
     
     # Initialize CSV files only if files don't exist
-    if (-not (Test-Path $RawDataFile)) {
+    if (-not $PermissionsOnly -and -not (Test-Path $RawDataFile)) {
         $header = [PSCustomObject]@{
             Type = ""
             Path = ""
@@ -281,15 +446,37 @@ function Invoke-FileSystemScan {
         Export-ToCsv -Data $permHeader -FilePath $PermissionsFile -IsFirst
     }
     
-    # Get all items recursively
-    Write-Host "Enumerating all items..." -ForegroundColor Yellow
+    if ($PermissionsOnly) {
+        # Permissions-only mode: just collect permissions for the root path and its subfolders
+        Write-Host "Collecting permissions for folders..." -ForegroundColor Yellow
+        
+        try {
+            # Get all folders recursively for permissions collection
+            $folders = Get-ChildItem -Path $Path -Directory -Recurse -Force -ErrorAction SilentlyContinue
+            $allFolders = @($Path) + $folders.FullName
+            
+            Write-Host "Found $($allFolders.Count) folders to process for permissions" -ForegroundColor Green
+        } catch {
+            Write-Error "Error during permissions collection: $_"
+            return
+        }
+    } else {
+        # Full scan mode: get all items recursively
+        Write-Host "Enumerating all items..." -ForegroundColor Yellow
+        
+        try {
+            # Process folders first
+            $folders = Get-ChildItem -Path $Path -Directory -Recurse -Force -ErrorAction SilentlyContinue
+            $allFolders = @($Path) + $folders.FullName
+            
+            Write-Host "Found $($allFolders.Count) folders to process" -ForegroundColor Green
+        } catch {
+            Write-Error "Error during scan: $_"
+            return
+        }
+    }
     
     try {
-        # Process folders first
-        $folders = Get-ChildItem -Path $Path -Directory -Recurse -Force -ErrorAction SilentlyContinue
-        $allFolders = @($Path) + $folders.FullName
-        
-        Write-Host "Found $($allFolders.Count) folders to process" -ForegroundColor Green
         
         $folderIndex = 0
         foreach ($folderPath in $allFolders) {
@@ -298,41 +485,44 @@ function Invoke-FileSystemScan {
             try {
                 $folderItem = Get-Item -Path $folderPath -Force -ErrorAction Stop
                 
-                # Count files in this folder
-                $fileCount = Get-FolderFileCount -Path $folderPath
-                
-                # Check for issues
-                $pathLength = $folderPath.Length
-                $hasUnsupportedChars = Test-UnsupportedCharacters -Name $folderItem.Name -UnsupportedChars $Config.unsupportedCharacters
-                $isTooManyFiles = $fileCount -gt $Config.thresholds.maxFilesPerFolder
-                $isTooLongPath = $pathLength -gt $Config.thresholds.maxPathLength
-                
                 # Get permissions
                 $permissions = Get-FolderPermissions -FolderPath $folderPath
-                $hasExplicitPermissions = $permissions.Count -gt 0
                 
-                # Write folder data
-                $folderData = [PSCustomObject]@{
-                    Type = "Folder"
-                    Path = $folderPath
-                    Name = $folderItem.Name
-                    Extension = ""
-                    SizeBytes = 0
-                    Created = $folderItem.CreationTime.ToString("o")
-                    LastModified = $folderItem.LastWriteTime.ToString("o")
-                    PathLength = $pathLength
-                    FileCountInFolder = $fileCount
-                    HasUnsupportedChars = $hasUnsupportedChars
-                    IsUnsafeExtension = $false
-                    IsLargeFile = $false
-                    IsTooManyFiles = $isTooManyFiles
-                    IsTooLongPath = $isTooLongPath
-                    HasExplicitPermissions = $hasExplicitPermissions
+                if (-not $PermissionsOnly) {
+                    # Full scan mode: collect all folder data
+                    # Count files in this folder
+                    $fileCount = Get-FolderFileCount -Path $folderPath
+                    
+                    # Check for issues
+                    $pathLength = $folderPath.Length
+                    $hasUnsupportedChars = Test-UnsupportedCharacters -Name $folderItem.Name -UnsupportedChars $Config.unsupportedCharacters
+                    $isTooManyFiles = $fileCount -gt $Config.thresholds.maxFilesPerFolder
+                    $isTooLongPath = $pathLength -gt $Config.thresholds.maxPathLength
+                    $hasExplicitPermissions = $permissions.Count -gt 0
+                    
+                    # Write folder data
+                    $folderData = [PSCustomObject]@{
+                        Type = "Folder"
+                        Path = $folderPath
+                        Name = $folderItem.Name
+                        Extension = ""
+                        SizeBytes = 0
+                        Created = $folderItem.CreationTime.ToString("o")
+                        LastModified = $folderItem.LastWriteTime.ToString("o")
+                        PathLength = $pathLength
+                        FileCountInFolder = $fileCount
+                        HasUnsupportedChars = $hasUnsupportedChars
+                        IsUnsafeExtension = $false
+                        IsLargeFile = $false
+                        IsTooManyFiles = $isTooManyFiles
+                        IsTooLongPath = $isTooLongPath
+                        HasExplicitPermissions = $hasExplicitPermissions
+                    }
+                    
+                    Export-ToCsv -Data $folderData -FilePath $RawDataFile
                 }
                 
-                Export-ToCsv -Data $folderData -FilePath $RawDataFile
-                
-                # Write permissions
+                # Write permissions (always collect these)
                 foreach ($perm in $permissions) {
                     Export-ToCsv -Data $perm -FilePath $PermissionsFile
                 }
@@ -362,10 +552,11 @@ function Invoke-FileSystemScan {
         
         Write-Progress -Activity "Processing Folders" -Completed
         
-        # Process files (optional)
-        $shouldScanFiles = $false
-        if ($Config.PSObject.Properties['scanFiles']) { $shouldScanFiles = [bool]$Config.scanFiles }
-        if ($shouldScanFiles) {
+        # Process files (optional) - skip in permissions-only mode
+        if (-not $PermissionsOnly) {
+            $shouldScanFiles = $false
+            if ($Config.PSObject.Properties['scanFiles']) { $shouldScanFiles = [bool]$Config.scanFiles }
+            if ($shouldScanFiles) {
             Write-Host "Processing files..." -ForegroundColor Yellow
             $files = Get-ChildItem -Path $Path -File -Recurse -Force -ErrorAction SilentlyContinue
             
@@ -382,6 +573,9 @@ function Invoke-FileSystemScan {
                 $isLargeFile = $file.Length -gt $Config.thresholds.maxFileSize
                 $isTooLongPath = $pathLength -gt $Config.thresholds.maxPathLength
                 
+                # Apply AccessEnum logic to determine if file should be included
+                $hasExplicitPermissions = Get-FilePermissions -FilePath $file.FullName
+                
                 $fileData = [PSCustomObject]@{
                     Type = "File"
                     Path = $file.FullName
@@ -397,7 +591,7 @@ function Invoke-FileSystemScan {
                     IsLargeFile = $isLargeFile
                     IsTooManyFiles = $false
                     IsTooLongPath = $isTooLongPath
-                    HasExplicitPermissions = $false
+                    HasExplicitPermissions = $hasExplicitPermissions
                 }
                 
                 Export-ToCsv -Data $fileData -FilePath $RawDataFile
@@ -424,12 +618,15 @@ function Invoke-FileSystemScan {
                 Write-Warning "Failed to process file $($file.FullName) : $_"
             }
             }
+            }
+            else {
+                Write-Host "Skipping file enumeration (scanFiles=false)" -ForegroundColor Yellow
+            }
+            
+            Write-Progress -Activity "Processing Files" -Completed
+        } else {
+            Write-Host "Skipping file enumeration (permissions-only mode)" -ForegroundColor Yellow
         }
-        else {
-            Write-Host "Skipping file enumeration (scanFiles=false)" -ForegroundColor Yellow
-        }
-        
-        Write-Progress -Activity "Processing Files" -Completed
         
     } catch {
         Write-Error "Error during scan: $_"

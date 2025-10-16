@@ -4,13 +4,15 @@ classify_and_report.py
 Department classification and Excel report generation for SharePoint migration analysis.
 """
 # /// script
-# dependencies = ["pandas", "openpyxl"]
+# dependencies = ["pandas", "openpyxl", "requests", "python-dotenv"]
 # ///
 
 import argparse
 import json
 import csv
 import re
+import os
+import requests
 from pathlib import Path
 from collections import defaultdict, Counter
 from datetime import datetime
@@ -18,220 +20,255 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils.dataframe import dataframe_to_rows
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
-# Embedded department keywords for classification
-DEPARTMENT_KEYWORDS = {
-    "Executive": ["executive", "ceo", "president", "c-suite", "board", "exec", "strategy", "leadership", "founders", "management team"],
-    "Finance": ["finance", "financials", "budgets", "forecasting", "expense reports", "ap", "ar", "accounts payable", "accounts receivable", "invoicing", "payments", "cashflow", "general ledger", "reconciliation"],
-    "Accounting": ["accounting", "bookkeep", "bookkeeping", "journal entries", "audit", "balance sheet", "profit loss", "trial balance", "tax", "1099", "w2", "payroll journal", "qb", "quickbooks", "myob", "sage", "peachtree"],
-    "Human Resources": ["hr", "human resources", "employees", "staff records", "recruiting", "hiring", "onboarding", "offboarding", "benefits", "personnel", "timesheets", "attendance", "performance reviews", "resumes", "applicants", "training records"],
-    "Payroll": ["payroll", "paystubs", "payslips", "compensation", "salary", "wages", "deductions", "timecards", "adp", "paychex", "intuit payroll"],
-    "Legal": ["legal", "contracts", "agreements", "nda", "litigation", "compliance docs", "policies", "terms", "licensing", "trademarks", "patents", "regulatory", "counsel"],
-    "Administration": ["admin", "administration", "office admin", "clerical", "schedules", "forms", "procedures", "templates", "policies", "correspondence", "memos"],
-    "Operations": ["operations", "ops", "procedures", "workflow", "process docs", "sop", "production schedule", "maintenance", "scheduling", "dispatch", "capacity planning"],
-    "Facilities": ["facilities", "maintenance", "building", "property", "lease", "office layout", "safety", "security", "janitorial", "equipment logs", "hvac", "inspection"],
-    "Information Technology": ["it", "information technology", "network", "systems", "infrastructure", "servers", "backups", "helpdesk", "support tickets", "software", "hardware", "configs", "logs", "endpoints", "security", "vpn", "firewall", "group policy"],
-    "Security": ["security", "infosec", "cyber", "antivirus", "monitoring", "soc", "incidents", "breaches", "policies", "credentials", "encryption", "risk assessment"],
-    "Sales": ["sales", "crm", "leads", "opportunities", "quotes", "proposals", "orders", "customers", "pipelines", "forecasts", "commissions", "sf", "salesforce"],
-    "Marketing": ["marketing", "campaigns", "ads", "advertising", "branding", "collateral", "flyers", "social media", "website", "seo", "sem", "newsletters", "content", "creative", "graphics", "media", "events"],
-    "Customer Service": ["customer service", "support", "tickets", "cases", "complaints", "feedback", "returns", "helpdesk", "customers", "satisfaction", "warranty"],
-    "Product Management": ["product", "roadmap", "features", "specs", "backlog", "release notes", "planning", "requirements", "prd", "epic", "jira exports"],
-    "Project Management": ["projects", "pm", "gantt", "schedule", "timelines", "milestones", "deliverables", "scope", "pmo", "client projects", "resources"],
-    "Procurement": ["procurement", "purchasing", "orders", "suppliers", "vendors", "requisitions", "po", "purchase orders", "quotes", "bids", "sourcing"],
-    "Supply Chain": ["supply chain", "logistics", "inventory", "fulfillment", "distribution", "warehouse", "shipping", "receiving", "tracking", "supply", "demand"],
-    "Inventory": ["inventory", "stock", "sku", "items", "parts", "assets", "warehouse", "supplies", "bins", "counts", "reorder", "inventory report"],
-    "Logistics": ["logistics", "shipping", "delivery", "freight", "transport", "routing", "trucking", "carriers", "dispatch", "packing slips", "manifests"],
-    "Engineering": ["engineering", "design", "cad", "drawings", "blueprints", "schematics", "calculations", "specs", "r&d", "prototype", "testing", "simulation"],
-    "Research and Development": ["research", "development", "rnd", "lab", "experiments", "innovation", "patents", "trials", "formulations", "testing", "reports"],
-    "Quality Assurance": ["qa", "qc", "quality", "inspection", "defects", "audits", "standards", "testing", "nonconformance", "corrective actions", "iso", "reports"],
-    "Training": ["training", "learning", "lms", "education", "onboarding", "tutorials", "certification", "course", "development plan", "safety training"],
-    "Business Development": ["business dev", "bizdev", "partnerships", "opportunities", "mergers", "alliances", "joint ventures", "proposals", "growth"],
-    "Vendor Management": ["vendor", "supplier", "partner", "agreements", "onboarding", "evaluations", "scorecards", "compliance docs", "purchase orders"],
-    "Compliance": ["compliance", "policy", "audit", "regulation", "iso", "soc2", "gdpr", "hipaa", "certification", "documentation", "risk register", "standards"]
-}
+# Department list for AI classification
+DEPARTMENTS = [
+    "Executive", "Finance", "Accounting", "Human Resources", "Payroll", "Legal", 
+    "Administration", "Operations", "Facilities", "Information Technology", "Security",
+    "Sales", "Marketing", "Customer Service", "Product Management", "Project Management",
+    "Procurement", "Supply Chain", "Inventory", "Logistics", "Engineering", 
+    "Research and Development", "Quality Assurance", "Training", "Business Development",
+    "Vendor Management", "Compliance"
+]
 
 
 class DepartmentClassifier:
-    """Implements bottom-up consensus algorithm for department classification."""
+    """Implements pure AI-based classification for department folders."""
     
-    def __init__(self, keywords_file=None):
+    def __init__(self, use_ai=True, openai_api_key=None):
         """
-        Initialize classifier with embedded or external keywords.
+        Initialize classifier with AI-based classification.
         
         Args:
-            keywords_file: Optional CSV file to load keywords from. If None, uses embedded keywords.
+            use_ai: Whether to use OpenAI API for classification
+            openai_api_key: OpenAI API key (if None, uses OPENAI_API_KEY environment variable)
         """
-        if keywords_file and Path(keywords_file).exists():
-            self.department_keywords = {}
-            self.load_keywords_from_file(keywords_file)
-        else:
-            # Use embedded keywords
-            self.department_keywords = DEPARTMENT_KEYWORDS
-            print(f"Using embedded keywords for {len(self.department_keywords)} departments")
-    
-    def load_keywords_from_file(self, keywords_file):
-        """Load and parse department keywords from CSV file."""
-        print(f"Loading department keywords from {keywords_file}...")
+        self.use_ai = use_ai
+        self.openai_api_key = openai_api_key or os.getenv('OPENAI_API_KEY')
         
-        with open(keywords_file, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                dept = row['Department'].strip()
-                keywords_str = row['Keywords'].strip()
+        if self.use_ai and not self.openai_api_key:
+            print("Error: OpenAI API key not found.")
+            print("Please set OPENAI_API_KEY environment variable or use --openai-key parameter.")
+            raise ValueError("OpenAI API key is required for AI-based classification.")
+    
+    
+    def get_top_level_folders(self, df):
+        """Extract top-level folders from the dataset."""
+        folders_df = df[df['Type'] == 'Folder'].copy()
+        top_level_folders = {}
+        
+        for idx, row in folders_df.iterrows():
+            path = row['Path']
+            path_parts = path.split(os.sep)
+            
+            # Get the first non-root part as top-level folder
+            if len(path_parts) > 1:
+                top_level_folder = path_parts[1]  # Skip the drive letter
+                full_path = path_parts[0] + os.sep + top_level_folder
                 
-                # Parse keywords (comma-separated, may include spaces and underscores)
-                keywords = [kw.strip().lower().replace('_', ' ') 
-                           for kw in keywords_str.split(',')]
-                
-                self.department_keywords[dept] = keywords
+                if full_path not in top_level_folders:
+                    top_level_folders[full_path] = {
+                        'name': top_level_folder,
+                        'path': full_path,
+                        'samples': []
+                    }
         
-        print(f"Loaded {len(self.department_keywords)} departments from file")
+        return top_level_folders
     
-    def tokenize(self, text):
-        """Convert text to tokens for keyword matching."""
-        if not text:
-            return []
+    def get_folder_samples(self, df, top_level_path, sample_size=25):
+        """Get sample file paths from a top-level folder."""
+        # Get files and folders under this top-level path
+        relevant_items = df[
+            (df['Path'].str.startswith(top_level_path + os.sep)) & 
+            (df['Path'] != top_level_path)  # Exclude the top-level folder itself
+        ]
         
-        # Convert to lowercase, replace special chars with spaces
-        text = text.lower()
-        text = re.sub(r'[_\-\.\\/]+', ' ', text)
+        # Sample files and folders
+        files = relevant_items[relevant_items['Type'] == 'File']
+        folders = relevant_items[relevant_items['Type'] == 'Folder']
         
-        # Extract words (alphanumeric sequences)
-        tokens = re.findall(r'\b\w+\b', text)
+        # Combine and sample
+        all_items = pd.concat([files, folders])
+        if len(all_items) > sample_size:
+            all_items = all_items.sample(n=sample_size, random_state=42)
         
-        return tokens
+        return all_items['Path'].tolist()
     
-    def score_text(self, text, department_keywords):
-        """Score text against department keywords."""
-        tokens = self.tokenize(text)
-        
-        if not tokens:
-            return 0
-        
-        score = 0
-        tokens_str = ' '.join(tokens)
-        
-        for keyword in department_keywords:
-            keyword_tokens = keyword.split()
+    def classify_with_openai(self, folder_name, file_samples, model="gpt-4o-mini"):
+        """Classify a folder using OpenAI API."""
+        try:
+            # Prepare the prompt
+            samples_text = '\n'.join(file_samples[:25])  # Limit to 25 samples
+            departments = ', '.join(DEPARTMENTS)
             
-            # Check for exact keyword match in token string
-            if keyword in tokens_str:
-                score += len(keyword_tokens) * 2  # Multi-word matches get bonus
-            else:
-                # Check individual keyword tokens
-                for kw_token in keyword_tokens:
-                    if kw_token in tokens:
-                        score += 1
-        
-        return score
-    
-    def classify_item(self, name, parent_path=''):
-        """Classify a single item (file or folder) by name."""
-        scores = {}
-        
-        for dept, keywords in self.department_keywords.items():
-            # Score the item name
-            name_score = self.score_text(name, keywords)
+            prompt = f"""You are a file system analyst helping to classify department folders for a SharePoint migration.
+
+Available departments: {departments}
+
+Folder name: {folder_name}
+
+Sample file paths under this folder:
+{samples_text}
+
+Based on the folder name and the file path patterns, classify this folder into the most appropriate department. Consider:
+1. The folder name itself
+2. The types of files and subfolders present
+3. The naming patterns and content indicators
+4. The overall context of the file structure
+
+Respond with ONLY the department name (one of: {departments}) or "Unknown" if none clearly fit."""
+
+            # Call OpenAI API
+            headers = {
+                "Authorization": f"Bearer {self.openai_api_key}",
+                "Content-Type": "application/json"
+            }
             
-            # Score the parent path (lower weight)
-            path_score = self.score_text(parent_path, keywords) * 0.3
+            data = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 50,
+                "temperature": 0.1
+            }
             
-            scores[dept] = name_score + path_score
-        
-        # Return department with highest score
-        if max(scores.values()) > 0:
-            return max(scores, key=scores.get), scores
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            classification = result['choices'][0]['message']['content'].strip()
+            
+            # Validate the response
+            if classification in DEPARTMENTS:
+                return classification
         else:
-            return "Unclassified", scores
+                print(f"OpenAI returned invalid classification: {classification}")
+                return "Unknown"
+                
+        except Exception as e:
+            print(f"OpenAI API call failed: {e}")
+            return "Unknown"
+    
+    def get_immediate_children(self, df, parent_path):
+        """Get immediate children (files and folders) of a parent path."""
+        children = []
+        for idx, row in df.iterrows():
+            path = row['Path']
+            if path.startswith(parent_path + os.sep):
+                # Check if this is an immediate child (not deeper)
+                relative_path = path[len(parent_path) + 1:]
+                if os.sep not in relative_path:  # No additional path separators
+                    children.append(path)
+        return children
     
     def classify_hierarchy(self, df):
         """
-        Implement bottom-up consensus algorithm.
+        Implement pure AI-based classification for top-level folders and their immediate children.
         
         Algorithm:
-        1. For each folder from deepest to shallowest:
-            a. Score files within folder
-            b. Score subfolder classifications
-            c. Score folder name itself (higher weight)
-            d. Aggregate scores and assign department
-        2. Propagate classifications upward
+        1. Identify top-level folders and classify them using AI
+        2. For each top-level folder, classify its immediate children using AI
+        3. Propagate classifications downward to all files and subfolders
         """
-        print("\nStarting hierarchical classification...")
+        print("\nStarting AI-based hierarchical classification...")
         
         # Prepare data structures
         folders_df = df[df['Type'] == 'Folder'].copy()
         files_df = df[df['Type'] == 'File'].copy()
         
-        # Calculate folder depths
-        folders_df['Depth'] = folders_df['Path'].apply(lambda x: x.count('\\'))
-        
-        # Sort by depth (deepest first)
-        folders_df = folders_df.sort_values('Depth', ascending=False)
-        
         # Dictionary to store folder classifications and scores
         folder_classifications = {}
         folder_confidence = {}
         
-        print(f"Classifying {len(folders_df)} folders...")
+        if not self.use_ai:
+            print("Error: AI classification is required but not available.")
+            print("Please set OPENAI_API_KEY environment variable or use --openai-key parameter.")
+            raise ValueError("AI classification is required but OpenAI API key is not available.")
         
-        # Process each folder from deepest to shallowest
+        # Step 1: Classify top-level folders using AI
+        print("Classifying top-level folders using AI...")
+        top_level_folders = self.get_top_level_folders(df)
+        
+        for folder_path, folder_info in top_level_folders.items():
+            folder_name = folder_info['name']
+            print(f"  Classifying top-level: {folder_name}")
+            
+            # Get sample file paths from the entire folder tree
+            samples = self.get_folder_samples(df, folder_path, sample_size=25)
+            print(f"    Found {len(samples)} sample paths")
+            
+            # Classify using AI
+            classification = self.classify_with_openai(folder_name, samples)
+            print(f"    AI Classification: {classification}")
+            
+            folder_classifications[folder_path] = classification
+            folder_confidence[folder_path] = 1.0  # High confidence for AI classification
+        
+        # Step 2: Classify immediate children of top-level folders using AI
+        print("Classifying immediate children of top-level folders using AI...")
+        
+        for top_level_path in top_level_folders.keys():
+            print(f"  Processing children of: {top_level_path}")
+            
+            # Get immediate children (files and folders)
+            immediate_children = self.get_immediate_children(df, top_level_path)
+            
+            for child_path in immediate_children:
+                # Skip if already classified
+                if child_path in folder_classifications:
+                    continue
+                
+                # Get child info
+                child_row = df[df['Path'] == child_path].iloc[0]
+                child_name = child_row['Name']
+                child_type = child_row['Type']
+                
+                print(f"    Classifying {child_type}: {child_name}")
+                
+                # Get samples from this child and its descendants
+                child_samples = self.get_folder_samples(df, child_path, sample_size=15)
+                print(f"      Found {len(child_samples)} sample paths")
+                
+                # Classify using AI
+                classification = self.classify_with_openai(child_name, child_samples)
+                print(f"      AI Classification: {classification}")
+                
+                folder_classifications[child_path] = classification
+                folder_confidence[child_path] = 0.8  # Slightly lower confidence for children
+        
+        # Step 3: For remaining folders, inherit from parent or use fallback
+        print("Processing remaining folders...")
+        
+        # Calculate folder depths
+        folders_df['Depth'] = folders_df['Path'].apply(lambda x: x.count(os.sep))
+        
+        # Sort by depth (deepest first)
+        folders_df = folders_df.sort_values('Depth', ascending=False)
+        
         for idx, folder_row in folders_df.iterrows():
             folder_path = folder_row['Path']
-            folder_name = folder_row['Name']
             
-            # Initialize department scores
-            dept_scores = defaultdict(float)
+            # Skip if already classified
+            if folder_path in folder_classifications:
+                continue
             
-            # 1. Score folder name (weight: 5.0)
-            folder_dept, folder_scores = self.classify_item(folder_name)
-            for dept, score in folder_scores.items():
-                dept_scores[dept] += score * 5.0
-            
-            # 2. Score files in this folder (weight: 1.0 per file)
-            folder_files = files_df[files_df['Path'].str.startswith(folder_path + '\\')]
-            for _, file_row in folder_files.iterrows():
-                file_name = file_row['Name']
-                file_dept, file_scores = self.classify_item(file_name)
-                for dept, score in file_scores.items():
-                    dept_scores[dept] += score * 1.0
-            
-            # 3. Score immediate subfolders (weight: 3.0 per subfolder)
-            immediate_subfolders = [fp for fp in folder_classifications.keys() 
-                                   if Path(fp).parent == Path(folder_path)]
-            
-            for subfolder_path in immediate_subfolders:
-                subfolder_dept = folder_classifications[subfolder_path]
-                if subfolder_dept != "Unclassified":
-                    # Give score to the subfolder's assigned department
-                    dept_scores[subfolder_dept] += folder_confidence.get(subfolder_path, 1.0) * 3.0
-            
-            # Determine final classification
-            if dept_scores and max(dept_scores.values()) > 0:
-                best_dept = max(dept_scores, key=dept_scores.get)
-                confidence = dept_scores[best_dept]
-            else:
-                best_dept = "Unclassified"
-                confidence = 0.0
-            
-            folder_classifications[folder_path] = best_dept
-            folder_confidence[folder_path] = confidence
-        
-        # Classify files based on their parent folder
-        print(f"Classifying {len(files_df)} files based on folder hierarchy...")
-        
-        file_classifications = {}
-        for idx, file_row in files_df.iterrows():
-            file_path = file_row['Path']
-            parent_folder = str(Path(file_path).parent)
-            
-            # Find the closest parent folder that has a classification
-            current_path = parent_folder
+            # Find the closest parent that has a classification
+            current_path = str(Path(folder_path).parent)
             classification = "Unclassified"
+            confidence = 0.0
             
             while current_path:
                 if current_path in folder_classifications:
                     classification = folder_classifications[current_path]
+                    confidence = folder_confidence.get(current_path, 0.5) * 0.7  # Reduce confidence for inheritance
                     break
                 
                 parent = str(Path(current_path).parent)
@@ -239,11 +276,16 @@ class DepartmentClassifier:
                     break
                 current_path = parent
             
-            file_classifications[file_path] = classification
+            folder_classifications[folder_path] = classification
+            folder_confidence[folder_path] = confidence
         
-        print("Classification complete!")
+        print("AI-based folder classification complete!")
+        
+        # Return empty file classifications since we only classify folders
+        file_classifications = {}
         
         return folder_classifications, folder_confidence, file_classifications
+    
 
 
 class ExcelReportGenerator:
@@ -318,8 +360,8 @@ class ExcelReportGenerator:
             'Explicit Permissions': df['HasExplicitPermissions'].sum()
         }
         
-        # Count by department
-        dept_counts = Counter(file_classifications.values())
+        # Count by department (folders only)
+        dept_counts = Counter(folder_classifications.values())
         
         # Write summary data
         row = 1
@@ -388,13 +430,13 @@ class ExcelReportGenerator:
         """Create detailed files sheet."""
         files_df = df[df['Type'] == 'File'].copy()
         
-        # Add classification
-        files_df['Department'] = files_df['Path'].map(file_classifications)
+        # Files don't have direct classifications, but we can show parent folder info
+        files_df['ParentFolder'] = files_df['Path'].apply(lambda x: str(Path(x).parent))
         
-        # Select and order columns
+        # Select and order columns (removed Department since files aren't classified)
         columns = [
             'Path', 'Name', 'Extension', 'SizeBytes', 'Created', 'LastModified',
-            'Department', 'PathLength', 'HasUnsupportedChars', 'IsUnsafeExtension',
+            'ParentFolder', 'PathLength', 'HasUnsupportedChars', 'IsUnsafeExtension',
             'IsLargeFile', 'IsTooLongPath'
         ]
         
@@ -493,9 +535,22 @@ class ExcelReportGenerator:
             item_type = row['Type']
             item_name = row['Name']
             
-            # Get classification
+            # Get classification (only folders are classified)
             if item_type == 'File':
-                dept = file_classifications.get(item_path, 'Unclassified')
+                # For files, get department from parent folder
+                parent_folder = str(Path(item_path).parent)
+                dept = "Unclassified"
+                
+                # Find the closest parent folder that has a classification
+                current_path = parent_folder
+                while current_path:
+                    if current_path in folder_classifications:
+                        dept = folder_classifications[current_path]
+                        break
+                    parent = str(Path(current_path).parent)
+                    if parent == current_path:  # Reached root
+                        break
+                    current_path = parent
             else:
                 dept = folder_classifications.get(item_path, 'Unclassified')
             
@@ -581,10 +636,10 @@ class ExcelReportGenerator:
     
     def create_classification_sheet(self, df, folder_classifications, folder_confidence, 
                                     file_classifications):
-        """Create department classification details sheet."""
+        """Create department classification details sheet (folders only)."""
         classification_list = []
         
-        # Folders
+        # Only process folders since files are not classified
         folders_df = df[df['Type'] == 'Folder']
         for idx, row in folders_df.iterrows():
             path = row['Path']
@@ -594,18 +649,6 @@ class ExcelReportGenerator:
                 'Name': row['Name'],
                 'Department': folder_classifications.get(path, 'Unclassified'),
                 'Confidence Score': folder_confidence.get(path, 0.0)
-            })
-        
-        # Files (sample - top by size)
-        files_df = df[df['Type'] == 'File'].nlargest(1000, 'SizeBytes')
-        for idx, row in files_df.iterrows():
-            path = row['Path']
-            classification_list.append({
-                'Type': 'File',
-                'Path': path,
-                'Name': row['Name'],
-                'Department': file_classifications.get(path, 'Unclassified'),
-                'Confidence Score': ''
             })
         
         classification_df = pd.DataFrame(classification_list)
@@ -643,8 +686,9 @@ def main():
     parser.add_argument('--config', required=True, help='Configuration JSON file')
     parser.add_argument('--raw-data', required=True, help='Raw scan data CSV file')
     parser.add_argument('--permissions', required=True, help='Permissions CSV file')
-    parser.add_argument('--keywords', required=False, help='Optional: Custom department keywords CSV file (uses embedded keywords if not provided)')
     parser.add_argument('--output', required=True, help='Output Excel file')
+    parser.add_argument('--use-ai', action='store_true', help='Use OpenAI API for classification (required)')
+    parser.add_argument('--openai-key', required=False, help='OpenAI API key (if not provided, uses OPENAI_API_KEY environment variable)')
     
     args = parser.parse_args()
     
@@ -679,8 +723,11 @@ def main():
     permissions_df = pd.read_csv(args.permissions)
     print(f"Loaded {len(permissions_df)} permission entries")
     
-    # Initialize classifier (with optional custom keywords file)
-    classifier = DepartmentClassifier(args.keywords if args.keywords else None)
+    # Initialize classifier with AI support
+    classifier = DepartmentClassifier(
+        use_ai=args.use_ai,
+        openai_api_key=args.openai_key
+    )
     
     # Perform classification
     folder_classifications, folder_confidence, file_classifications = \

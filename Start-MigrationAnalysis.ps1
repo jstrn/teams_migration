@@ -69,6 +69,12 @@ try {
         unsupportedCharacters = $configJson.unsupportedCharacters
     }
     
+    # Generate timestamped Excel filename to avoid conflicts
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $baseFileName = [System.IO.Path]::GetFileNameWithoutExtension($config.excelOutputFile)
+    $directory = [System.IO.Path]::GetDirectoryName($config.excelOutputFile)
+    $config.excelOutputFile = Join-Path $directory "$baseFileName`_$timestamp.xlsx"
+    
     # Optional: Include departmentKeywordsFile if specified (for custom keywords)
     if ($configJson.PSObject.Properties['departmentKeywordsFile'] -and $configJson.departmentKeywordsFile) {
         $config.departmentKeywordsFile = $configJson.departmentKeywordsFile
@@ -145,7 +151,24 @@ function Invoke-WizTreeExport {
         [string]$OutputCsv,
         [string]$WizTreeExe
     )
-    & $WizTreeExe $TargetPath /export="$OutputCsv" /admin=1 /exportUTCTime=1 /exportfolders=1 /exportfiles=1 | Out-Null
+    
+    Write-Host "Starting WizTree export for: $TargetPath" -ForegroundColor Gray
+    
+    # Start the WizTree process and wait for it to complete
+    $process = Start-Process -FilePath $WizTreeExe -ArgumentList @(
+        $TargetPath,
+        "/export=`"$OutputCsv`"",
+        "/admin=1",
+        "/exportUTCTime=1", 
+        "/exportfolders=1",
+        "/exportfiles=1"
+    ) -Wait -PassThru -WindowStyle Hidden
+    
+    if ($process.ExitCode -eq 0) {
+        Write-Host "WizTree export completed successfully" -ForegroundColor Green
+    } else {
+        Write-Warning "WizTree export completed with exit code: $($process.ExitCode)"
+    }
 }
 
 function Convert-WizTreeCsvToRawSchema {
@@ -166,23 +189,56 @@ function Convert-WizTreeCsvToRawSchema {
     $allRows = New-Object System.Collections.Generic.List[object]
 
     foreach ($csvPath in $InputCsvPaths) {
-        if (-not (Test-Path $csvPath)) { continue }
-        $rows = Import-Csv -Path $csvPath
+        if (-not (Test-Path $csvPath)) { 
+            Write-Warning "CSV file not found: $csvPath"
+            continue 
+        }
+        
+        Write-Host "Processing WizTree CSV: $csvPath" -ForegroundColor Gray
+        
+        # WizTree CSV has a comment line at the top, so we need to skip it
+        $content = Get-Content -Path $csvPath
+        $headerLine = $content[1]  # Second line is the header
+        $dataLines = $content[2..($content.Length-1)]  # Skip first two lines (comment + header)
+        
+        # Create a temporary CSV without the comment line
+        $tempCsv = [System.IO.Path]::GetTempFileName()
+        $headerLine | Out-File -FilePath $tempCsv -Encoding UTF8
+        $dataLines | Out-File -FilePath $tempCsv -Append -Encoding UTF8
+        
+        $rows = Import-Csv -Path $tempCsv
+        Remove-Item -Path $tempCsv -Force
+        
+        Write-Host "  Found $($rows.Count) rows in CSV" -ForegroundColor Gray
+        
         foreach ($r in $rows) {
             $fullName = [string]$r.'File Name'
-            if (-not $fullName) { continue }
+            if (-not $fullName -or $fullName -eq "") { 
+                Write-Host "  Skipping empty File Name" -ForegroundColor Gray
+                continue 
+            }
 
             $isFolder = $fullName.EndsWith("\")
             $path = if ($isFolder) { $fullName.TrimEnd('\') } else { $fullName }
             $name = Split-Path -Path $path -Leaf
             $extension = if ($isFolder) { "" } else { [System.IO.Path]::GetExtension($name) }
-            $sizeBytes = if ($isFolder) { 0 } else { [long]($r.Size -as [decimal]) }
+            $sizeBytes = if ($isFolder) { 0 } else { 
+                try {
+                    [long]($r.Size -as [decimal])
+                } catch {
+                    Write-Warning "Failed to parse size '$($r.Size)' for $fullName, using 0"
+                    0
+                }
+            }
             $lastModified = [string]$r.Modified
             $created = $lastModified
             $pathLength = ($path).Length
             $fileCountInFolder = 0
             if ($isFolder -and $r.PSObject.Properties.Name -contains 'Files' -and $r.Files) {
-                [int]::TryParse($r.Files, [ref]$fileCountInFolder) | Out-Null
+                if (-not [int]::TryParse($r.Files, [ref]$fileCountInFolder)) {
+                    Write-Warning "Failed to parse file count '$($r.Files)' for $fullName, using 0"
+                    $fileCountInFolder = 0
+                }
             }
 
             $hasUnsupportedChars = $false
@@ -224,6 +280,13 @@ function Convert-WizTreeCsvToRawSchema {
     if (-not (Test-Path (Split-Path -Path $OutputCsv -Parent))) {
         New-Item -Path (Split-Path -Path $OutputCsv -Parent) -ItemType Directory -Force | Out-Null
     }
+    
+    Write-Host "Total rows to export: $($allRows.Count)" -ForegroundColor Cyan
+    if ($allRows.Count -eq 0) {
+        Write-Warning "No rows to export - check WizTree CSV files"
+        return
+    }
+    
     $allRows | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
     Write-Host "Raw data CSV written: $OutputCsv" -ForegroundColor Green
 }
@@ -294,33 +357,42 @@ if (-not $SkipScan) {
         Write-Error "WizTree executable not found in script directory. Expected WizTree64.exe or WizTree.exe"
         exit 1
     }
-
+    
     $totalPaths = $config.paths.Count
     $pathIndex = 0
     $tempDir = Join-Path $config.outputDirectory 'wiztree_tmp'
     if (-not (Test-Path $tempDir)) { New-Item -Path $tempDir -ItemType Directory -Force | Out-Null }
     $exportParts = @()
-
+    
     foreach ($scanPath in $config.paths) {
         $pathIndex++
-
+        
         Write-Host "`n--- Scanning Path $pathIndex of $totalPaths ---" -ForegroundColor Cyan
         Write-Host "Path: $scanPath" -ForegroundColor White
-
+        
         if (-not (Test-Path $scanPath)) {
             Write-Warning "Path does not exist, skipping: $scanPath"
             continue
         }
-
+        
         if ($checkpoint -and $checkpoint.lastCompletedPath -and $scanPath -eq $checkpoint.lastCompletedPath) {
             Write-Host "Skipping already completed path (from checkpoint)" -ForegroundColor Yellow
             continue
         }
-
+        
         try {
             $out = Join-Path $tempDir ("wiztree_" + [Guid]::NewGuid().ToString() + ".csv")
+            Write-Host "Exporting to: $out" -ForegroundColor Gray
             Invoke-WizTreeExport -TargetPath $scanPath -OutputCsv $out -WizTreeExe $wizTreeExe
-            $exportParts += $out
+            
+            if (Test-Path $out) {
+                $fileSize = (Get-Item $out).Length
+                Write-Host "WizTree export created: $out (Size: $fileSize bytes)" -ForegroundColor Green
+                $exportParts += $out
+            } else {
+                Write-Warning "WizTree export file not found: $out"
+            }
+            
             Write-Host "Completed WizTree export for: $scanPath" -ForegroundColor Green
         } catch {
             Write-Error "Failed to export via WizTree for $scanPath : $_"
@@ -330,9 +402,50 @@ if (-not $SkipScan) {
     # Convert to raw schema expected by classifier
     Convert-WizTreeCsvToRawSchema -InputCsvPaths $exportParts -OutputCsv $config.rawDataFile -Config $config
 
-    # Apply permissions flag if permissions CSV is present (kept as-is per plan)
-    ApplyExplicitPermissionsFlag -RawDataCsv $config.rawDataFile -PermissionsCsv $config.permissionsFile
+    # Collect permissions for each path using Get-FileSystemAnalysis.ps1
+    Write-Host "`nCollecting permissions data..." -ForegroundColor Yellow
+    
+    $permissionsCollected = $false
+    foreach ($scanPath in $config.paths) {
+        if (-not (Test-Path $scanPath)) {
+            Write-Warning "Path does not exist, skipping permissions collection: $scanPath"
+            continue
+        }
+        
+        try {
+            Write-Host "Collecting permissions for: $scanPath" -ForegroundColor Gray
+            
+            # Call Get-FileSystemAnalysis.ps1 for permissions only
+            $permissionsParams = @{
+                Path = $scanPath
+                Config = $config
+                RawDataFile = $config.rawDataFile
+                PermissionsFile = $config.permissionsFile
+                CheckpointFile = $config.checkpointFile
+                Resume = $Resume
+                PermissionsOnly = $true
+            }
+            
+            # Run permissions collection (this will append to permissionsFile)
+            & ".\Get-FileSystemAnalysis.ps1" @permissionsParams
+            
+            $permissionsCollected = $true
+            Write-Host "Completed permissions collection for: $scanPath" -ForegroundColor Green
+            
+        } catch {
+            Write-Error "Failed to collect permissions for $scanPath : $_"
+        }
+    }
+    
+    if ($permissionsCollected) {
+        Write-Host "Permissions collection completed!" -ForegroundColor Green
+    } else {
+        Write-Warning "No permissions were collected - HasExplicitPermissions will remain false"
+    }
 
+    # Apply permissions flag if permissions CSV is present
+    ApplyExplicitPermissionsFlag -RawDataCsv $config.rawDataFile -PermissionsCsv $config.permissionsFile
+    
     Write-Host "`n[3/4] File system scan completed!" -ForegroundColor Green
 } else {
     Write-Host "`n[2/4] Skipping file system scan (SkipScan flag set)" -ForegroundColor Yellow
@@ -341,25 +454,21 @@ if (-not $SkipScan) {
 # Classification and reporting phase
 Write-Host "`n[3/4] Starting classification and report generation..." -ForegroundColor Yellow
 
-# Check if uv is available
-Write-Host "Checking for uv..." -ForegroundColor Yellow
+# Run setup validation to ensure uv is available
+Write-Host "Validating setup and dependencies..." -ForegroundColor Yellow
 
 try {
-    $uvVersion = & uv --version 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "Found uv: $uvVersion" -ForegroundColor Green
-    } else {
-        throw "uv not found"
+    # Run Test-Setup.ps1 to check and install uv if needed
+    & ".\Test-Setup.ps1" -ConfigFile $ConfigFile
+    
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Setup validation failed. Please check the errors above and fix them before continuing."
+        exit 1
     }
+    
+    Write-Host "Setup validation completed successfully" -ForegroundColor Green
 } catch {
-    Write-Error @"
-uv is not installed. Please install uv to continue:
-
-  Windows (PowerShell):
-    powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-  Or visit: https://docs.astral.sh/uv/getting-started/installation/
-"@
+    Write-Error "Failed to run setup validation: $_"
     exit 1
 }
 
@@ -374,17 +483,10 @@ try {
         "--config", $ConfigFile,
         "--raw-data", $config.rawDataFile,
         "--permissions", $config.permissionsFile,
-        "--output", $config.excelOutputFile
+        "--output", $config.excelOutputFile,
+        "--use-ai"
     )
     
-    # If a custom keywords file is specified and exists, use it
-    if ($config.PSObject.Properties['departmentKeywordsFile'] -and 
-        $config.departmentKeywordsFile -and 
-        (Test-Path $config.departmentKeywordsFile)) {
-        Write-Host "Using custom keywords file: $($config.departmentKeywordsFile)" -ForegroundColor Cyan
-        $uvArgs += "--keywords"
-        $uvArgs += $config.departmentKeywordsFile
-    }
     
     & uv @uvArgs
     

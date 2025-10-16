@@ -77,7 +77,7 @@ try {
         irm https://astral.sh/uv/install.ps1 | iex
         
         # Update PATH for current session
-        $env:Path = "C:\Users\Default\.local\bin;$env:Path"
+        $Env:PATH = "~\.local\bin;$Env:PATH"
         
         # Install Python 3.12
         Write-Host "       Installing Python 3.12..." -ForegroundColor Yellow
