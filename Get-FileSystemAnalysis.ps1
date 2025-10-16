@@ -300,12 +300,12 @@ function Test-UnsupportedCharacters {
         return $false
     }
     
-    # Check for trailing spaces or periods (Windows restriction)
-    if ($Name.EndsWith(" ") -or $Name.EndsWith(".")) {
+    # Check for leading/trailing spaces (Windows restriction)
+    if ($Name.StartsWith(" ") -or $Name.EndsWith(" ")) {
         return $true
     }
     
-    # Check for unsupported characters
+    # Check for unsupported characters (only the truly problematic ones)
     foreach ($char in $UnsupportedChars) {
         if ($Name.Contains($char)) {
             return $true

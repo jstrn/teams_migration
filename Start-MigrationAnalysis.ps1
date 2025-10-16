@@ -244,7 +244,9 @@ function Convert-WizTreeCsvToRawSchema {
             $hasUnsupportedChars = $false
             foreach ($ch in $unsupportedChars) {
                 if ([string]::IsNullOrEmpty($ch)) { continue }
-                if ($path -like ("*" + $ch + "*")) { $hasUnsupportedChars = $true; break }
+                # Escape wildcard characters for literal matching
+                $escapedChar = $ch -replace '\[', '\[' -replace '\]', '\]' -replace '\?', '\?' -replace '\*', '\*'
+                if ($name -like ("*" + $escapedChar + "*")) { $hasUnsupportedChars = $true; break }
             }
 
             $isUnsafeExtension = $false

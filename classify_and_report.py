@@ -160,13 +160,18 @@ Respond with ONLY the department name (one of: {departments}) or "Unknown" if no
     def get_immediate_children(self, df, parent_path):
         """Get immediate children (files and folders) of a parent path."""
         children = []
+        parent_path_normalized = parent_path.rstrip(os.sep) + os.sep
+        
         for idx, row in df.iterrows():
             path = row['Path']
-            if path.startswith(parent_path + os.sep):
-                # Check if this is an immediate child (not deeper)
-                relative_path = path[len(parent_path) + 1:]
-                if os.sep not in relative_path:  # No additional path separators
+            if path.startswith(parent_path_normalized):
+                # Get the relative path after the parent
+                relative_path = path[len(parent_path_normalized):]
+                
+                # Check if this is an immediate child (only one path component)
+                if relative_path and os.sep not in relative_path:
                     children.append(path)
+        
         return children
     
     def classify_hierarchy(self, df):
@@ -248,41 +253,7 @@ Respond with ONLY the department name (one of: {departments}) or "Unknown" if no
                 folder_classifications[child_path] = classification
                 folder_confidence[child_path] = 0.8  # Slightly lower confidence for children
         
-        # Step 3: For remaining folders, inherit from parent or use fallback
-        print("Processing remaining folders...")
-        
-        # Calculate folder depths
-        folders_df['Depth'] = folders_df['Path'].apply(lambda x: x.count(os.sep))
-        
-        # Sort by depth (deepest first)
-        folders_df = folders_df.sort_values('Depth', ascending=False)
-        
-        for idx, folder_row in folders_df.iterrows():
-            folder_path = folder_row['Path']
-            
-            # Skip if already classified
-            if folder_path in folder_classifications:
-                continue
-            
-            # Find the closest parent that has a classification
-            current_path = str(Path(folder_path).parent)
-            classification = "Unclassified"
-            confidence = 0.0
-            
-            while current_path:
-                if current_path in folder_classifications:
-                    classification = folder_classifications[current_path]
-                    confidence = folder_confidence.get(current_path, 0.5) * 0.7  # Reduce confidence for inheritance
-                    break
-                
-                parent = str(Path(current_path).parent)
-                if parent == current_path:  # Reached root
-                    break
-                current_path = parent
-            
-            folder_classifications[folder_path] = classification
-            folder_confidence[folder_path] = confidence
-        
+        # Step 3: No inheritance - we only classify top-level and immediate children
         print("AI-based folder classification complete!")
         
         # Return empty file classifications since we only classify folders
@@ -643,15 +614,17 @@ class ExcelReportGenerator:
         """Create department classification details sheet (folders only)."""
         classification_list = []
         
-        # Only process folders since files are not classified
-        folders_df = df[df['Type'] == 'Folder']
-        for idx, row in folders_df.iterrows():
-            path = row['Path']
+        # Only process folders that were actually classified by AI
+        for path, department in folder_classifications.items():
+            # Find the folder row in the dataframe
+            folder_row = df[df['Path'] == path]
+            if not folder_row.empty:
+                row = folder_row.iloc[0]
             classification_list.append({
                 'Type': 'Folder',
                 'Path': path,
                 'Name': row['Name'],
-                'Department': folder_classifications.get(path, 'Unclassified'),
+                    'Department': department,
                 'Confidence Score': folder_confidence.get(path, 0.0)
             })
         
