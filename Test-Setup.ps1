@@ -72,16 +72,18 @@ try {
     try {
         # Set TLS 1.2 for secure downloads
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        
+        if (-not (Test-Path "C:\Users\Default\.local\bin")) {
+            New-Item -Path "C:\Users\Default\.local\bin" -ItemType Directory | Out-Null
+        }
         # Install uv
         irm https://astral.sh/uv/install.ps1 | iex
         
         # Update PATH for current session
-        $Env:PATH = "~\.local\bin;$Env:PATH"
+        $Env:PATH = "$HOME\.local\bin;$Env:PATH"
         
         # Install Python 3.12
         Write-Host "       Installing Python 3.12..." -ForegroundColor Yellow
-        uv python install 3.12
+        C:\Users\Default\.local\bin\uv.exe python install 3.12.10
         
         # Verify installation
         $uvVersion = & uv --version 2>&1

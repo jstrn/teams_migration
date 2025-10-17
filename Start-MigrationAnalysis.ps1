@@ -13,10 +13,13 @@
     Path to configuration JSON file (default: config.json)
 
 .PARAMETER Resume
-    Resume from last checkpoint if available
+    Resume from last checkpoint if available. Will skip WizTree and permissions collection if data is fresh (within 24 hours) and scan paths unchanged.
 
 .PARAMETER SkipScan
     Skip the file system scan and go directly to classification/reporting
+
+.PARAMETER ForceScan
+    Force a fresh scan even if existing data is available and fresh
 #>
 
 param(
@@ -27,11 +30,110 @@ param(
     [switch]$Resume,
     
     [Parameter(Mandatory=$false)]
-    [switch]$SkipScan
+    [switch]$SkipScan,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$ForceScan
 )
 
 # Set error action preference
 $ErrorActionPreference = "Stop"
+
+# Function definitions
+function Test-ExistingDataFreshness {
+    param(
+        [hashtable]$Config,
+        [object]$Checkpoint
+    )
+    
+    # Check if required output files exist
+    if (-not (Test-Path $Config.rawDataFile)) {
+        Write-Host "  Raw data file missing: $($Config.rawDataFile)" -ForegroundColor Yellow
+        return $false
+    }
+    
+    if (-not (Test-Path $Config.permissionsFile)) {
+        Write-Host "  Permissions file missing: $($Config.permissionsFile)" -ForegroundColor Yellow
+        return $false
+    }
+    
+    # Check if data is recent (within last 24 hours)
+    $maxAgeHours = 24
+    $rawDataAge = (Get-Date) - (Get-Item $Config.rawDataFile).LastWriteTime
+    $permissionsAge = (Get-Date) - (Get-Item $Config.permissionsFile).LastWriteTime
+    
+    if ($rawDataAge.TotalHours -gt $maxAgeHours) {
+        Write-Host "  Raw data is older than $maxAgeHours hours: $([math]::Round($rawDataAge.TotalHours, 1))h" -ForegroundColor Yellow
+        return $false
+    }
+    
+    if ($permissionsAge.TotalHours -gt $maxAgeHours) {
+        Write-Host "  Permissions data is older than $maxAgeHours hours: $([math]::Round($permissionsAge.TotalHours, 1))h" -ForegroundColor Yellow
+        return $false
+    }
+    
+    # Check if scan paths have changed (only if checkpoint has scanPaths)
+    if ($Checkpoint.scanPaths) {
+        $currentPaths = @($Config.paths | Sort-Object)
+        $checkpointPaths = @($Checkpoint.scanPaths | Sort-Object)
+        
+        if (Compare-Object $currentPaths $checkpointPaths) {
+            Write-Host "  Scan paths have changed since last run" -ForegroundColor Yellow
+            Write-Host "    Current: $($currentPaths -join ', ')" -ForegroundColor Gray
+            Write-Host "    Checkpoint: $($checkpointPaths -join ', ')" -ForegroundColor Gray
+            return $false
+        }
+    } else {
+        # Old checkpoint format - assume paths might have changed
+        Write-Host "  Old checkpoint format - cannot verify scan paths unchanged" -ForegroundColor Yellow
+        return $false
+    }
+    
+    # Check if any scan paths have been modified since last scan
+    if ($Checkpoint.lastScanTime) {
+        $lastScanTime = [DateTime]::Parse($Checkpoint.lastScanTime)
+        foreach ($scanPath in $Config.paths) {
+            if (Test-Path $scanPath) {
+                $pathLastWrite = (Get-Item $scanPath).LastWriteTime
+                if ($pathLastWrite -gt $lastScanTime) {
+                    Write-Host "  Scan path modified since last scan: $scanPath" -ForegroundColor Yellow
+                    return $false
+                }
+            }
+        }
+    } else {
+        # Old checkpoint format - cannot verify timestamps
+        Write-Host "  Old checkpoint format - cannot verify scan timestamps" -ForegroundColor Yellow
+        return $false
+    }
+    
+    Write-Host "  Data is fresh and scan paths unchanged" -ForegroundColor Green
+    return $true
+}
+
+function Save-ScanCheckpoint {
+    param(
+        [hashtable]$Config,
+        [array]$ScanPaths
+    )
+    
+    try {
+        $checkpoint = @{
+            lastScanTime = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
+            scanPaths = $ScanPaths
+            rawDataFile = $Config.rawDataFile
+            permissionsFile = $Config.permissionsFile
+            lastCompletedPath = if ($ScanPaths.Count -gt 0) { $ScanPaths[-1] } else { "" }
+            filesProcessed = 0  # Will be updated by actual scan logic
+            foldersProcessed = 0  # Will be updated by actual scan logic
+        }
+        
+        $checkpoint | ConvertTo-Json -Depth 3 | Set-Content -Path $Config.checkpointFile -Encoding UTF8
+        Write-Host "Checkpoint saved: $($Config.checkpointFile)" -ForegroundColor Gray
+    } catch {
+        Write-Warning "Failed to save checkpoint: $_"
+    }
+}
 
 # Display banner
 Write-Host @"
@@ -129,8 +231,9 @@ if (-not (Test-Path $config.outputDirectory)) {
     Write-Host "Created output directory: $($config.outputDirectory)" -ForegroundColor Green
 }
 
-# Check for checkpoint
+# Check for checkpoint and validate data freshness
 $checkpoint = $null
+$useExistingData = $false
 
 if ($Resume -and (Test-Path $config.checkpointFile)) {
     Write-Host "`n[2/4] Loading checkpoint..." -ForegroundColor Yellow
@@ -139,6 +242,19 @@ if ($Resume -and (Test-Path $config.checkpointFile)) {
         Write-Host "Checkpoint loaded - Last completed: $($checkpoint.lastCompletedPath)" -ForegroundColor Green
         Write-Host "  Files processed: $($checkpoint.filesProcessed)" -ForegroundColor Gray
         Write-Host "  Folders processed: $($checkpoint.foldersProcessed)" -ForegroundColor Gray
+        
+        # Check if we can use existing data (unless ForceScan is specified)
+        if ($ForceScan) {
+            Write-Host "`n[2/4] ForceScan specified - will re-scan regardless of existing data..." -ForegroundColor Yellow
+            $useExistingData = $false
+        } else {
+            $useExistingData = Test-ExistingDataFreshness -Config $config -Checkpoint $checkpoint
+            if ($useExistingData) {
+                Write-Host "`n[2/4] Using existing scan data (still fresh)..." -ForegroundColor Green
+            } else {
+                Write-Host "`n[2/4] Existing data is stale, will re-scan..." -ForegroundColor Yellow
+            }
+        }
     } catch {
         Write-Warning "Failed to load checkpoint: $_"
         $checkpoint = $null
@@ -186,7 +302,26 @@ function Convert-WizTreeCsvToRawSchema {
     $unsafeExt = @($Config.unsafeExtensions)
     $unsupportedChars = @($Config.unsupportedCharacters)
 
-    $allRows = New-Object System.Collections.Generic.List[object]
+    # Pre-compile regex patterns for unsupported characters (major performance boost)
+    $unsupportedPatterns = @()
+    foreach ($ch in $unsupportedChars) {
+        if ([string]::IsNullOrEmpty($ch)) { continue }
+        $escapedChar = [regex]::Escape($ch)
+        $unsupportedPatterns += [regex]::new($escapedChar, [System.Text.RegularExpressions.RegexOptions]::Compiled)
+    }
+
+    # Create output directory if needed
+    $outputDir = Split-Path -Path $OutputCsv -Parent
+    if (-not (Test-Path $outputDir)) {
+        New-Item -Path $outputDir -ItemType Directory -Force | Out-Null
+    }
+
+    # Use StringBuilder for efficient CSV writing
+    $csvBuilder = New-Object System.Text.StringBuilder
+    $csvBuilder.AppendLine("Path,Name,Extension,SizeBytes,Created,LastModified,Type,PathLength,HasUnsupportedChars,IsUnsafeExtension,IsLargeFile,IsTooManyFiles,IsTooLongPath,HasExplicitPermissions,FileCountInFolder") | Out-Null
+
+    $totalRows = 0
+    $processedRows = 0
 
     foreach ($csvPath in $InputCsvPaths) {
         if (-not (Test-Path $csvPath)) { 
@@ -196,101 +331,152 @@ function Convert-WizTreeCsvToRawSchema {
         
         Write-Host "Processing WizTree CSV: $csvPath" -ForegroundColor Gray
         
-        # WizTree CSV has a comment line at the top, so we need to skip it
-        $content = Get-Content -Path $csvPath
-        $headerLine = $content[1]  # Second line is the header
-        $dataLines = $content[2..($content.Length-1)]  # Skip first two lines (comment + header)
+        # Stream processing - read file line by line instead of loading all into memory
+        $reader = [System.IO.File]::OpenText($csvPath)
+        $lineNumber = 0
+        $headerLine = $null
         
-        # Create a temporary CSV without the comment line
-        $tempCsv = [System.IO.Path]::GetTempFileName()
-        $headerLine | Out-File -FilePath $tempCsv -Encoding UTF8
-        $dataLines | Out-File -FilePath $tempCsv -Append -Encoding UTF8
-        
-        $rows = Import-Csv -Path $tempCsv
-        Remove-Item -Path $tempCsv -Force
-        
-        Write-Host "  Found $($rows.Count) rows in CSV" -ForegroundColor Gray
-        
-        foreach ($r in $rows) {
-            $fullName = [string]$r.'File Name'
-            if (-not $fullName -or $fullName -eq "") { 
-                Write-Host "  Skipping empty File Name" -ForegroundColor Gray
-                continue 
-            }
-
-            $isFolder = $fullName.EndsWith("\")
-            $path = if ($isFolder) { $fullName.TrimEnd('\') } else { $fullName }
-            $name = Split-Path -Path $path -Leaf
-            $extension = if ($isFolder) { "" } else { [System.IO.Path]::GetExtension($name) }
-            $sizeBytes = if ($isFolder) { 0 } else { 
-                try {
-                    [long]($r.Size -as [decimal])
-                } catch {
-                    Write-Warning "Failed to parse size '$($r.Size)' for $fullName, using 0"
-                    0
+        try {
+            while (($line = $reader.ReadLine()) -ne $null) {
+                $lineNumber++
+                
+                # Skip comment line (line 1)
+                if ($lineNumber -eq 1) { continue }
+                
+                # Store header line (line 2)
+                if ($lineNumber -eq 2) { 
+                    $headerLine = $line
+                    continue 
                 }
-            }
-            $lastModified = [string]$r.Modified
-            $created = $lastModified
-            $pathLength = ($path).Length
-            $fileCountInFolder = 0
-            if ($isFolder -and $r.PSObject.Properties.Name -contains 'Files' -and $r.Files) {
-                if (-not [int]::TryParse($r.Files, [ref]$fileCountInFolder)) {
-                    Write-Warning "Failed to parse file count '$($r.Files)' for $fullName, using 0"
+                
+                # Process data lines
+                if ($lineNumber -gt 2) {
+                    $totalRows++
+                    
+                    # Parse CSV line manually (much faster than Import-Csv)
+                    $fields = Parse-CsvLine $line
+                    if ($fields.Count -lt 6) { continue }  # Skip malformed lines
+                    
+                    $fullName = $fields[0]
+                    if ([string]::IsNullOrEmpty($fullName)) { continue }
+
+                    $isFolder = $fullName.EndsWith("\")
+                    $path = if ($isFolder) { $fullName.TrimEnd('\') } else { $fullName }
+                    $name = Split-Path -Path $path -Leaf
+                    $extension = if ($isFolder) { "" } else { [System.IO.Path]::GetExtension($name) }
+                    
+                    # Parse size efficiently
+                    $sizeBytes = 0
+                    if (-not $isFolder -and $fields[1]) {
+                        if ([long]::TryParse($fields[1], [ref]$sizeBytes)) {
+                            # Success
+                        } else {
+                            # Try decimal parsing for large numbers
+                            if ([decimal]::TryParse($fields[1], [ref]$sizeBytes)) {
+                                $sizeBytes = [long]$sizeBytes
+                            }
+                        }
+                    }
+                    
+                    $lastModified = $fields[3]
+                    $created = $lastModified
+                    $pathLength = $path.Length
+                    
+                    # Parse file count for folders
                     $fileCountInFolder = 0
+                    if ($isFolder -and $fields.Count -gt 5 -and $fields[5]) {
+                        [int]::TryParse($fields[5], [ref]$fileCountInFolder) | Out-Null
+                    }
+
+                    # Optimized unsupported character checking
+                    $hasUnsupportedChars = $false
+                    if ($unsupportedPatterns.Count -gt 0) {
+                        foreach ($pattern in $unsupportedPatterns) {
+                            if ($pattern.IsMatch($name)) {
+                                $hasUnsupportedChars = $true
+                                break
+                            }
+                        }
+                    }
+
+                    # Check unsafe extension
+                    $isUnsafeExtension = $false
+                    if (-not $isFolder -and $extension) {
+                        $isUnsafeExtension = $unsafeExt -contains $extension.ToLower()
+                    }
+
+                    # Calculate flags
+                    $isLargeFile = (-not $isFolder -and $sizeBytes -gt $maxFileSize)
+                    $isTooManyFiles = ($isFolder -and $fileCountInFolder -gt $maxFilesPerFolder)
+                    $isTooLongPath = ($pathLength -gt $maxPathLength)
+
+                    # Build CSV line directly (much faster than PSCustomObject)
+                    $csvLine = "$path,$name,$extension,$sizeBytes,$created,$lastModified,$(if ($isFolder) { 'Folder' } else { 'File' }),$pathLength,$(if ($hasUnsupportedChars) { 'True' } else { 'False' }),$(if ($isUnsafeExtension) { 'True' } else { 'False' }),$(if ($isLargeFile) { 'True' } else { 'False' }),$(if ($isTooManyFiles) { 'True' } else { 'False' }),$(if ($isTooLongPath) { 'True' } else { 'False' }),False,$fileCountInFolder"
+                    $csvBuilder.AppendLine($csvLine) | Out-Null
+                    
+                    $processedRows++
+                    
+                    # Progress indicator for large files
+                    if ($processedRows % 10000 -eq 0) {
+                        Write-Host "  Processed $processedRows rows..." -ForegroundColor Gray
+                    }
                 }
             }
-
-            $hasUnsupportedChars = $false
-            foreach ($ch in $unsupportedChars) {
-                if ([string]::IsNullOrEmpty($ch)) { continue }
-                # Escape wildcard characters for literal matching
-                $escapedChar = $ch -replace '\[', '\[' -replace '\]', '\]' -replace '\?', '\?' -replace '\*', '\*'
-                if ($name -like ("*" + $escapedChar + "*")) { $hasUnsupportedChars = $true; break }
-            }
-
-            $isUnsafeExtension = $false
-            if (-not $isFolder -and $extension) {
-                $isUnsafeExtension = $unsafeExt -contains $extension.ToLower()
-            }
-
-            $isLargeFile = (-not $isFolder -and $sizeBytes -gt $maxFileSize)
-            $isTooManyFiles = ($isFolder -and $fileCountInFolder -gt $maxFilesPerFolder)
-            $isTooLongPath = ($pathLength -gt $maxPathLength)
-
-            $obj = [PSCustomObject]@{
-                'Path' = $path
-                'Name' = $name
-                'Extension' = $extension
-                'SizeBytes' = $sizeBytes
-                'Created' = $created
-                'LastModified' = $lastModified
-                'Type' = if ($isFolder) { 'Folder' } else { 'File' }
-                'PathLength' = $pathLength
-                'HasUnsupportedChars' = [bool]$hasUnsupportedChars
-                'IsUnsafeExtension' = [bool]$isUnsafeExtension
-                'IsLargeFile' = [bool]$isLargeFile
-                'IsTooManyFiles' = [bool]$isTooManyFiles
-                'IsTooLongPath' = [bool]$isTooLongPath
-                'HasExplicitPermissions' = $false
-                'FileCountInFolder' = $fileCountInFolder
-            }
-            $allRows.Add($obj) | Out-Null
+        } finally {
+            $reader.Close()
         }
-    }
-
-    if (-not (Test-Path (Split-Path -Path $OutputCsv -Parent))) {
-        New-Item -Path (Split-Path -Path $OutputCsv -Parent) -ItemType Directory -Force | Out-Null
+        
+        Write-Host "  Found $totalRows rows in CSV" -ForegroundColor Gray
     }
     
-    Write-Host "Total rows to export: $($allRows.Count)" -ForegroundColor Cyan
-    if ($allRows.Count -eq 0) {
+    Write-Host "Total rows to export: $processedRows" -ForegroundColor Cyan
+    if ($processedRows -eq 0) {
         Write-Warning "No rows to export - check WizTree CSV files"
         return
     }
     
-    $allRows | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+    # Write all data at once (much faster than Export-Csv)
+    [System.IO.File]::WriteAllText($OutputCsv, $csvBuilder.ToString(), [System.Text.Encoding]::UTF8)
     Write-Host "Raw data CSV written: $OutputCsv" -ForegroundColor Green
+}
+
+# Helper function to parse CSV line manually (much faster than Import-Csv)
+function Parse-CsvLine {
+    param([string]$line)
+    
+    $fields = @()
+    $currentField = ""
+    $inQuotes = $false
+    $i = 0
+    
+    while ($i -lt $line.Length) {
+        $char = $line[$i]
+        
+        if ($char -eq '"') {
+            if ($inQuotes -and $i + 1 -lt $line.Length -and $line[$i + 1] -eq '"') {
+                # Escaped quote
+                $currentField += '"'
+                $i += 2
+            } else {
+                # Toggle quote state
+                $inQuotes = -not $inQuotes
+                $i++
+            }
+        } elseif ($char -eq ',' -and -not $inQuotes) {
+            # Field separator
+            $fields += $currentField
+            $currentField = ""
+            $i++
+        } else {
+            $currentField += $char
+            $i++
+        }
+    }
+    
+    # Add the last field
+    $fields += $currentField
+    
+    return $fields
 }
 
 function ApplyExplicitPermissionsFlag {
@@ -348,7 +534,7 @@ function ApplyExplicitPermissionsFlag {
 }
 
 # File system scanning phase (replaced with WizTree export)
-if (-not $SkipScan) {
+if (-not $SkipScan -and -not $useExistingData) {
     Write-Host "`n[2/4] Starting file system scan (WizTree)..." -ForegroundColor Yellow
 
     $wizTreeExe = Join-Path $PSScriptRoot 'WizTree64.exe'
@@ -377,7 +563,13 @@ if (-not $SkipScan) {
             continue
         }
         
-        if ($checkpoint -and $checkpoint.lastCompletedPath -and $scanPath -eq $checkpoint.lastCompletedPath) {
+        # Skip path if we're using existing data (already handled by $useExistingData)
+        if ($useExistingData) {
+            Write-Host "Skipping WizTree export (using existing data)" -ForegroundColor Yellow
+            continue
+        }
+        
+        if ($checkpoint -and $checkpoint.lastCompletedPath -and $scanPath -eq $checkpoint.lastCompletedPath -and -not $useExistingData) {
             Write-Host "Skipping already completed path (from checkpoint)" -ForegroundColor Yellow
             continue
         }
@@ -448,7 +640,20 @@ if (-not $SkipScan) {
     # Apply permissions flag if permissions CSV is present
     ApplyExplicitPermissionsFlag -RawDataCsv $config.rawDataFile -PermissionsCsv $config.permissionsFile
     
+    # Save checkpoint with actual processed paths
+    $processedPaths = @()
+    foreach ($scanPath in $config.paths) {
+        if (Test-Path $scanPath) {
+            $processedPaths += $scanPath
+        }
+    }
+    Save-ScanCheckpoint -Config $config -ScanPaths $processedPaths
+    
     Write-Host "`n[3/4] File system scan completed!" -ForegroundColor Green
+} elseif ($useExistingData) {
+    Write-Host "`n[2/4] Using existing scan data (skipping WizTree and permissions collection)..." -ForegroundColor Green
+    Write-Host "  Raw data file: $($config.rawDataFile)" -ForegroundColor Gray
+    Write-Host "  Permissions file: $($config.permissionsFile)" -ForegroundColor Gray
 } else {
     Write-Host "`n[2/4] Skipping file system scan (SkipScan flag set)" -ForegroundColor Yellow
 }
